@@ -98,6 +98,12 @@ E_MAX = V_MAX * kd / kp   # largest position error the LQR is allowed to see
 ###########
 t_prev = t0
 
+# ---- adaptive-gain dt estimate ----
+DT_MIN, DT_MAX = 0.02, 2.0         # clamp so one huge spike can't produce a weird gain
+DT_ALPHA = 0.2                     # smoothing: weight of the newest measurement
+dt_est = DT                        # start at the design period
+# -----------------------------------
+
 # ---- timing instrumentation ----
 LOG_EVERY = 10                     # log every N iterations
 wall_prev = time.perf_counter()
@@ -137,6 +143,11 @@ while not exit_flag:
     wall_prev = wall_now
     timing_max["sim_dt"] = max(timing_max.get("sim_dt", 0.0), sim_dt)
     timing_max["wall_dt"] = max(timing_max.get("wall_dt", 0.0), wall_dt)
+
+    # Smoothed loop-period estimate for the adaptive gain. Skip iteration 0:
+    # t_prev starts at the sim's START time, so the first sim_dt is meaningless.
+    if iteration > 0:
+        dt_est = (1 - DT_ALPHA) * dt_est + DT_ALPHA * float(np.clip(sim_dt, DT_MIN, DT_MAX))
     w = _mark("clock", w)
 
     #####################################
@@ -234,7 +245,9 @@ while not exit_flag:
     r = np.linalg.norm(pos)
     g = -G_PHOBOS * pos / r if r > 0 else np.zeros(3)
 
-    accel_world = lqr.compute(pos, vel, ref_pos, tgt_vel, g)   # phobosFrame
+    # Adaptive gain: LQR re-designed for the measured period (cached, ~free).
+    # E_MAX stays fixed from the nominal gain so the speed cap doesn't jitter.
+    accel_world = lqr.compute(pos, vel, ref_pos, tgt_vel, g, dt=dt_est)   # phobosFrame
     accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
     SetCommand(accel_body, np.zeros(3))
     w = _mark("control", w)
@@ -242,7 +255,8 @@ while not exit_flag:
     # ---- timing log: worst value of each section over the last LOG_EVERY iterations ----
     if iteration % LOG_EVERY == 0:
         msg = (f"[it {iteration}] sim_dt={timing_max.get('sim_dt', 0):.3f} "
-               f"wall_dt={timing_max.get('wall_dt', 0):.3f} (design {DT:.3f}) | "
+               f"wall_dt={timing_max.get('wall_dt', 0):.3f} (design {DT:.3f}, "
+               f"gain dt {dt_est:.3f}) | "
                + " ".join(f"{k}={v*1000:.0f}ms" for k, v in timing_max.items()
                           if k not in ("sim_dt", "wall_dt"))
                + f" | dist={dist:.0f}m")
