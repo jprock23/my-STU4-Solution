@@ -91,12 +91,23 @@ G_PHOBOS  = 0.0057 # m/s^2, set to 0.0 to disable gravity feedforward
 max_pos_err, max_vel_err = 5.0, 2.0
 Q = np.diag([1/max_pos_err**2]*3 + [1/max_vel_err**2]*3)
 R = np.diag([1/MAX_ACCEL**2]*3)
-lqr = TranslationLQR(DT, Q, R, MAX_ACCEL)
+lqr = TranslationLQR(dt=DT, max_accel=MAX_ACCEL, Q=Q, R=R)   # keywords: safe for either arg order
 
 kp, kd = lqr.K[0, 0], lqr.K[0, 3]
 E_MAX = V_MAX * kd / kp   # largest position error the LQR is allowed to see
 ###########
 t_prev = t0
+
+# ---- timing instrumentation ----
+LOG_EVERY = 10                     # log every N iterations
+wall_prev = time.perf_counter()
+timing_max = {}                    # worst time per section since the last log
+def _mark(name, start):
+    """Record time since `start` for section `name`; return a new start time."""
+    now = time.perf_counter()
+    timing_max[name] = max(timing_max.get(name, 0.0), now - start)
+    return now
+# --------------------------------
 
 iteration = 0
 imageNumber = 0
@@ -107,7 +118,9 @@ while not exit_flag:
     # Wait between loop iterations #
     ################################
     
+    w = time.perf_counter()
     time.sleep(1.0 / this.GetParam(st.VarType.double, "LoopFreqHz"))
+    w = _mark("sleep", w)
 
     ###################################
     # Get elapsed time from sim start #
@@ -116,11 +129,15 @@ while not exit_flag:
     t_now: datetime.datetime = st.SimGlobals.SimClock.GetTimeNow().as_datetime()
     t_from_start: float = (t_now - t0).total_seconds()
 
-    # top of the loop, after t_now is computed
-    dt_actual = (t_now - t_prev).total_seconds()
+    # sim-clock dt vs wall-clock dt for the whole previous iteration
+    sim_dt = (t_now - t_prev).total_seconds()
     t_prev = t_now
-    if iteration % 20 == 0:
-        st.OnScreenLogMessage(f"dt={dt_actual:.3f} (design {DT:.3f})", "LoopDT", st.Severity.Info)
+    wall_now = time.perf_counter()
+    wall_dt = wall_now - wall_prev
+    wall_prev = wall_now
+    timing_max["sim_dt"] = max(timing_max.get("sim_dt", 0.0), sim_dt)
+    timing_max["wall_dt"] = max(timing_max.get("wall_dt", 0.0), wall_dt)
+    w = _mark("clock", w)
 
     #####################################
     # Example for getting vehicle state #
@@ -140,6 +157,7 @@ while not exit_flag:
     inertiaBodyFrame = shuttle.getInertiaTensor(shuttleFrame)
     damage: float = shuttle.GetParam(st.VarType.double, ["Stats", "Damage"])
     fuelUsed: float = shuttle.GetParam(st.VarType.double, ["Stats", "FuelUsed"])
+    w = _mark("state", w)
 
     ##################################################################
     # Example for rotating the top camera 30 deg left and 10 deg up, #
@@ -149,6 +167,7 @@ while not exit_flag:
     if iteration % 20 == 0:
         PanTiltCamera(topCamera, 30.0, -10.0)
         PanTiltCamera(bottomCamera, -20.0, 15.0)
+    w = _mark("pantilt", w)
 
     ####################################################################################
     # Example for obtaining an image from the top camera with FOV = 60 deg and EV = 12 #
@@ -171,6 +190,7 @@ while not exit_flag:
             imageNumber += 1
         else:
             st.OnScreenLogMessage("Failed to capture camera image :(", "CameraNoCapture", st.Severity.Info)
+    w = _mark("camera", w)
 
     ###################################################################################
     # Example for getting the positions, closest points, range rates, and diameters   #
@@ -185,6 +205,7 @@ while not exit_flag:
         closestDebris_rangeRate = closestDebris[1, 1]
         closestDebris_diameter = closestDebris[1, 2]
         st.OnScreenLogMessage(f"Nearest debris: {np.linalg.norm(closestDebris_loc):.1f} m", "UserAPIPrintout", st.Severity.Info)
+    w = _mark("debris", w)
 
     ##################################
     # YOUR CONTROLLER CODE GOES HERE #
@@ -216,6 +237,18 @@ while not exit_flag:
     accel_world = lqr.compute(pos, vel, ref_pos, tgt_vel, g)   # phobosFrame
     accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
     SetCommand(accel_body, np.zeros(3))
+    w = _mark("control", w)
+
+    # ---- timing log: worst value of each section over the last LOG_EVERY iterations ----
+    if iteration % LOG_EVERY == 0:
+        msg = (f"[it {iteration}] sim_dt={timing_max.get('sim_dt', 0):.3f} "
+               f"wall_dt={timing_max.get('wall_dt', 0):.3f} (design {DT:.3f}) | "
+               + " ".join(f"{k}={v*1000:.0f}ms" for k, v in timing_max.items()
+                          if k not in ("sim_dt", "wall_dt"))
+               + f" | dist={dist:.0f}m")
+        st.OnScreenLogMessage(msg, "Timing", st.Severity.Info)
+        print(msg, flush=True)     # also goes to the console/log file for later
+        timing_max.clear()
 
     iteration += 1
 
