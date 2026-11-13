@@ -13,6 +13,10 @@ st.connect_to_sim(sys.argv)
 import numpy as np
 import numpy.typing as npt
 
+#### Custom imports
+from LQR import TranslationLQR
+####
+
 
 this = st.GetThisSystem()
 
@@ -78,6 +82,21 @@ t0: datetime.datetime = t0_sim.as_datetime()
 ##################
 # Start the loop #
 ##################
+##########
+DT        = 1.0/this.GetParam(st.VarType.double, "LoopFreqHz")    # MUST match how often the code below runs
+MAX_ACCEL = 0.5    # m/s^2 -- set from the shuttle's real thrust/mass
+V_MAX     = 5.0    # approach-speed cap, m/s (see table)
+G_PHOBOS  = 0.0057 # m/s^2, set to 0.0 to disable gravity feedforward
+
+max_pos_err, max_vel_err = 5.0, 2.0
+Q = np.diag([1/max_pos_err**2]*3 + [1/max_vel_err**2]*3)
+R = np.diag([1/MAX_ACCEL**2]*3)
+lqr = TranslationLQR(DT, Q, R, MAX_ACCEL)
+
+kp, kd = lqr.K[0, 0], lqr.K[0, 3]
+E_MAX = V_MAX * kd / kp   # largest position error the LQR is allowed to see
+###########
+t_prev = t0
 
 iteration = 0
 imageNumber = 0
@@ -96,6 +115,12 @@ while not exit_flag:
 
     t_now: datetime.datetime = st.SimGlobals.SimClock.GetTimeNow().as_datetime()
     t_from_start: float = (t_now - t0).total_seconds()
+
+    # top of the loop, after t_now is computed
+    dt_actual = (t_now - t_prev).total_seconds()
+    t_prev = t_now
+    if iteration % 20 == 0:
+        st.OnScreenLogMessage(f"dt={dt_actual:.3f} (design {DT:.3f})", "LoopDT", st.Severity.Info)
 
     #####################################
     # Example for getting vehicle state #
@@ -165,11 +190,32 @@ while not exit_flag:
     # YOUR CONTROLLER CODE GOES HERE #
     ##################################
 
-    linearAcceleration_m_s2 = np.array([0.0,0.0,1.0])
-    angularAcceleration_rad_s2 = np.zeros(3)
+    # ===== every tick =====
+    shuttleFrame = shuttle.GetBodyFixedFrame()
 
-    # Send acceleration and angular acceleration commands
-    SetCommand(linearAcceleration_m_s2, angularAcceleration_rad_s2)
+    shuttle_state = shuttle.getLocVelAcc()
+    pos = np.asarray(shuttle_state.loc_WRT_ExprIn(phobosFrame), dtype=float)
+    vel = np.asarray(shuttle_state.vel_WRT_ExprIn(phobosFrame), dtype=float)
+
+    target_state = target.getLocVelAcc()
+    tgt_pos = np.asarray(target_state.loc_WRT_ExprIn(phobosFrame), dtype=float)
+    tgt_vel = np.asarray(target_state.vel_WRT_ExprIn(phobosFrame), dtype=float)
+
+    # Clamp: if the target is far, aim at a point E_MAX away along the line to it
+    to_target = tgt_pos - pos
+    dist = np.linalg.norm(to_target)
+    if dist > E_MAX:
+        ref_pos = pos + to_target * (E_MAX / dist)
+    else:
+        ref_pos = tgt_pos
+
+    # Gravity points toward Phobos' center (assumes phobosFrame origin is the center)
+    r = np.linalg.norm(pos)
+    g = -G_PHOBOS * pos / r if r > 0 else np.zeros(3)
+
+    accel_world = lqr.compute(pos, vel, ref_pos, tgt_vel, g)   # phobosFrame
+    accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
+    SetCommand(accel_body, np.zeros(3))
 
     iteration += 1
 
