@@ -165,7 +165,7 @@ while not exit_flag:
     # YOUR CONTROLLER CODE GOES HERE #
     ##################################
 
-    linearAcceleration_m_s2 = np.array([0.0,0.0,1.0])
+    linearAcceleration_m_s2 = np.array([0.0,0.0,0.0])
     angularAcceleration_rad_s2 = np.zeros(3)
 
     # Send acceleration and angular acceleration commands
