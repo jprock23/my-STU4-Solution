@@ -3,18 +3,18 @@ from scipy.signal import cont2discrete
 from scipy.linalg import solve_discrete_are
 
 class TranslationLQR:
-    def __init__(self, dt, max_accel, Q, R):
+    def __init__(self, dt, Q, R, max_accel):
         ################################
         # X = [px, py, pz, vx, vy, vz]
-        # B = [ax, ay, az]
+        # u = [ax, ay, az]
         #################################
         self.dt = dt
         self.max_accel = max_accel
         
         self.A = np.block([[np.zeros((3,3)), np.eye(3)], [np.zeros((3,3)), np.zeros((3,3))]]) # px = vx*t, py = vy*t, pz = vz*t, all other equations are null
-        self.B = np.block(np.zeros(3,3), np.eye(3)) # vx = ax*t, vy=ay*t, vz=az*t
+        self.B = np.block([[np.zeros((3,3))], [np.eye(3)]]) # vx = ax*t, vy=ay*t, vz=az*t
 
-        self.Ad, self.Bd, *_ = cont2discrete((self.A, self.B, np.eye(6), np.zeros((3,3))), self.dt)
+        self.Ad, self.Bd, *_ = cont2discrete((self.A, self.B, np.eye(6), np.zeros((6,3))), self.dt)
         self.set_weights(Q, R)
 
     def set_weights(self, Q, R):
