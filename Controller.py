@@ -241,7 +241,7 @@ while not exit_flag:
     else:
         ref_pos = tgt_pos
 
-    # Gravity points toward Phobos' center (assumes phobosFrame origin is the center)
+    # Gravity points toward Phobos' center
     r = np.linalg.norm(pos)
     g = -G_PHOBOS * pos / r if r > 0 else np.zeros(3)
 
