@@ -209,21 +209,23 @@ while not exit_flag:
 
     accel_world = lqr.compute(pos, vel, pos, v_cmd, g, dt=dt_est)   # phobosFrame
     accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
+    msg = (f"lin_accel_x: {accel_body[0]}, lin_accel_y: {accel_body[1]}, lin_accel_x: {accel_body[2]}")
+    st.OnScreenLogMessage(msg, "Commands", st.Severity.Info)
 
     SetCommand(accel_body, np.zeros(3))
     w = _mark("control", w)
 
     # ---- timing log: worst value of each section over the last LOG_EVERY iterations ----
-    if iteration % LOG_EVERY == 0:
-        msg = (f"[it {iteration}] sim_dt={timing_max.get('sim_dt', 0):.3f} "
-               f"wall_dt={timing_max.get('wall_dt', 0):.3f} (design {DT:.3f}, "
-               f"gain dt {dt_est:.3f}) | "
-               + " ".join(f"{k}={v*1000:.0f}ms" for k, v in timing_max.items()
-                          if k not in ("sim_dt", "wall_dt"))
-               + f" | dist={dist:.0f}m")
-        st.OnScreenLogMessage(msg, "Timing", st.Severity.Info)
-        print(msg, flush=True)     # also goes to the console/log file for later
-        timing_max.clear()
+    # if iteration % LOG_EVERY == 0:
+    #     msg = (f"[it {iteration}] sim_dt={timing_max.get('sim_dt', 0):.3f} "
+    #            f"wall_dt={timing_max.get('wall_dt', 0):.3f} (design {DT:.3f}, "
+    #            f"gain dt {dt_est:.3f}) | "
+    #            + " ".join(f"{k}={v*1000:.0f}ms" for k, v in timing_max.items()
+    #                       if k not in ("sim_dt", "wall_dt"))
+    #            + f" | dist={dist:.0f}m")
+    #     st.OnScreenLogMessage(msg, "Timing", st.Severity.Info)
+    #     print(msg, flush=True)     # also goes to the console/log file for later
+    #     timing_max.clear()
 
     iteration += 1
 
