@@ -273,12 +273,12 @@ while not exit_flag:
     # ---- tracker log ----
     # radar_updates / LOG_EVERY ticks tells you the real radar rate:
     # e.g. 10 updates in 10 ticks = radar runs at the loop rate; 2 = 1/5 of it.
-    if USE_TRACKER and iteration % LOG_EVERY == 0:
-        msg = (f"[it {iteration}] radar_updates={radar_updates}/{LOG_EVERY} "
-               f"obs={len(obstacles)} | {tracker.format_debug()}")
-        st.OnScreenLogMessage(msg, "Tracker", st.Severity.Info)
-        print(msg, flush=True)
-        radar_updates = 0
+    # if USE_TRACKER and iteration % LOG_EVERY == 0:
+    #     msg = (f"[it {iteration}] radar_updates={radar_updates}/{LOG_EVERY} "
+    #            f"obs={len(obstacles)} | {tracker.format_debug()}")
+    #     st.OnScreenLogMessage(msg, "Tracker", st.Severity.Info)
+    #     print(msg, flush=True)
+    #     radar_updates = 0
 
     iteration += 1
 
