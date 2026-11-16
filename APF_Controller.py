@@ -70,7 +70,19 @@ from PIL import Image
 #### Custom imports
 from LQR import TranslationLQR
 from apf_planner import APFPlanner, APFConfig, Obstacle
+from debris_tracker import DebrisTracker, TrackerConfig
 ####
+
+USE_TRACKER = True      # False -> fall back to radar_to_obstacles (zero velocity)
+RADAR_MAX_RANGE = 150.0 # m, shared by the tracker and the fallback
+
+# Shuttle-frame vector -> Phobos-frame axes (rotation only, no translation).
+# Reads the global shuttleFrame at call time, so it uses the frame refreshed
+# at the top of each tick.
+def shuttle_to_phobos(v_body):
+    return np.asarray(st.frames.FramedVector(v_body, shuttleFrame).ExprIn(phobosFrame), float)
+
+
 def radar_to_obstacles(debris_info, own_pos, max_range=150.0):
     obs = []
     for d in debris_info:
@@ -110,6 +122,19 @@ cfg = APFConfig(cruise_speed=V_MAX, max_speed=V_MAX,
                 goal_slowdown_radius=2 * V_MAX**2 / (2 * MAX_ACCEL),   # 2x stopping distance
                 deadband_distance=40.0, influence_radius=40.0)
 planner = APFPlanner(None, cfg)
+planner.reset()
+
+# Values from the offline tests (test_debris_tracker.py, 10 Hz, ~0.2 m noise).
+# Re-tune once you know the real radar period and noise.
+tracker_cfg = TrackerConfig(max_range=RADAR_MAX_RANGE,
+                            beta=0.05,
+                            max_misses=6,
+                            sigma_growth_per_miss=0.3)
+tracker = DebrisTracker(shuttle_to_phobos, tracker_cfg)
+tracker.reset()
+last_debris_raw = None      # to skip ticks where the radar hasn't refreshed
+obstacles = []
+radar_updates = 0
 
 
 kp, kd = lqr.K[0, 0], lqr.K[0, 3]
@@ -199,7 +224,25 @@ while not exit_flag:
 
     N = 200
     debrisInfo = GetNearestDebrisLocations(N)
-    obstacles = radar_to_obstacles(debrisInfo, pos) 
+    w = _mark("radar", w)
+
+    if USE_TRACKER:
+        # If the radar runs slower than this loop, the same frame comes back
+        # several ticks in a row. Feeding a repeat to the tracker would look
+        # like every rock froze (residual = -velocity*dt), dragging velocity
+        # estimates toward zero. Only update on a new frame; otherwise keep
+        # the last obstacle list (the planner re-predicts from velocities).
+        debris_raw = np.asarray(debrisInfo, float) if len(debrisInfo) else np.zeros((0, 3, 3))
+        is_new_frame = (last_debris_raw is None
+                        or debris_raw.shape != last_debris_raw.shape
+                        or not np.array_equal(debris_raw, last_debris_raw))
+        if is_new_frame:
+            obstacles = tracker.update(debrisInfo, pos, vel, t_from_start)
+            last_debris_raw = debris_raw
+            radar_updates += 1
+    else:
+        obstacles = radar_to_obstacles(debrisInfo, pos, max_range=RADAR_MAX_RANGE)
+    w = _mark("tracker", w)
 
     planner.set_goal(tgt_pos)
     v_ref = planner.compute(pos, vel, obstacles, dt_est)
@@ -209,7 +252,7 @@ while not exit_flag:
 
     accel_world = lqr.compute(pos, vel, pos, v_cmd, g, dt=dt_est)   # phobosFrame
     accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
-    msg = (f"lin_accel_x: {accel_body[0]}, lin_accel_y: {accel_body[1]}, lin_accel_x: {accel_body[2]}")
+    msg = (f"lin_accel_x: {accel_body[0]}, lin_accel_y: {accel_body[1]}, lin_accel_z: {accel_body[2]}")
     st.OnScreenLogMessage(msg, "Commands", st.Severity.Info)
 
     SetCommand(accel_body, np.zeros(3))
@@ -226,6 +269,16 @@ while not exit_flag:
     #     st.OnScreenLogMessage(msg, "Timing", st.Severity.Info)
     #     print(msg, flush=True)     # also goes to the console/log file for later
     #     timing_max.clear()
+
+    # ---- tracker log ----
+    # radar_updates / LOG_EVERY ticks tells you the real radar rate:
+    # e.g. 10 updates in 10 ticks = radar runs at the loop rate; 2 = 1/5 of it.
+    if USE_TRACKER and iteration % LOG_EVERY == 0:
+        msg = (f"[it {iteration}] radar_updates={radar_updates}/{LOG_EVERY} "
+               f"obs={len(obstacles)} | {tracker.format_debug()}")
+        st.OnScreenLogMessage(msg, "Tracker", st.Severity.Info)
+        print(msg, flush=True)
+        radar_updates = 0
 
     iteration += 1
 
