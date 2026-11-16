@@ -29,12 +29,10 @@ class TranslationLQR:
 
     def set_weights(self, Q, R):
         self.Q, self.R = Q, R
-        self._K_cache = {}                       # weights changed: old gains invalid
-        self.K = self.gain_for(self.dt)          # nominal gain (used for E_MAX etc.)
+        self._K_cache = {}
+        self.K = self.gain_for(self.dt)
 
     def gain_for(self, dt):
-        """LQR gain for loop period dt. Binned to 10 ms and cached, so after the
-        first few ticks this is just a dict lookup."""
         key = max(round(dt, 2), 0.01)
         if key not in self._K_cache:
             self._K_cache[key] = self._solve_gain(key)
