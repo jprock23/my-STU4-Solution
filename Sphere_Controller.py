@@ -138,7 +138,19 @@ G_PHOBOS  = 0.0057 # m/s^2, set to 0.0 to disable gravity feedforward
 max_pos_err, max_vel_err = 5.0, 2.0
 Q = np.diag([1/max_pos_err**2]*3 + [1/max_vel_err**2]*3)
 R = np.diag([1/MAX_ACCEL**2]*3)
-lqr = TranslationLQR(dt=DT, max_accel=MAX_ACCEL, Q=Q, R=R)
+lqr = TranslationLQR(dt=DT, max_accel=MAX_ACCEL, Q=Q, R=R)     # "default" = tight profile
+
+# Loose profile for open space (DIRECT mode): tolerate drift, spend less fuel.
+# Tune by comparing FuelUsed across runs.
+LOOSE_POS_ERR, LOOSE_VEL_ERR = 20.0, 1.0      # m, m/s
+LOOSE_R_SCALE = 4.0                           # thrust 4x "more expensive"
+LOOSE_DEADBAND = 0.02                         # m/s^2, ignore tiny commands (noise chatter)
+lqr.add_profile("loose",
+                Q=np.diag([1/LOOSE_POS_ERR**2]*3 + [1/LOOSE_VEL_ERR**2]*3),
+                R=np.diag([LOOSE_R_SCALE/MAX_ACCEL**2]*3),
+                u_deadband=LOOSE_DEADBAND)
+LOOSE_AFTER_TICKS = 10      # require this many consecutive DIRECT ticks before going loose
+direct_streak = 0
 
 # APF: still used as the sphere planner's fallback (emergency dodge / no corridor),
 # or as the only planner when USE_SPHERE = False.
@@ -179,7 +191,7 @@ obstacles_t = None          # sim time the current obstacle list is valid at
 radar_updates = 0
 
 
-kp, kd = lqr.K[0, 0], lqr.K[0, 3]
+kp, kd = lqr.pd_gains("default")      # corridor clamp uses the tight gains
 E_MAX = V_MAX * kd / kp   # largest position error the LQR is allowed to see
 ###########
 t_prev = t0
@@ -311,7 +323,18 @@ while not exit_flag:
 
     g = -G_PHOBOS * pos / np.linalg.norm(pos)
 
-    accel_world = lqr.compute(pos, vel, p_ref, v_cmd, g, dt=dt_est)   # phobosFrame
+    # Gain scheduling: loose only after a steady stretch of DIRECT (hysteresis, so a
+    # DIRECT <-> CORRIDOR flicker doesn't make the gains jump back and forth).
+    # Any other mode (EMERGENCY, CORRIDOR, LIFTOFF, FALLBACK) switches back to tight instantly.
+    direct_streak = direct_streak + 1 if (USE_SPHERE and sphere.mode == "DIRECT") else 0
+    if direct_streak >= LOOSE_AFTER_TICKS:
+        lqr_profile = "loose"
+        p_ref = pos                    # no cross-track pull in open space, just hold velocity
+    else:
+        lqr_profile = "default"
+
+    accel_world = lqr.compute(pos, vel, p_ref, v_cmd, g, dt=dt_est,
+                              profile=lqr_profile)                    # phobosFrame
     accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
     msg = (f"lin_accel_x: {accel_body[0]}, lin_accel_y: {accel_body[1]}, lin_accel_z: {accel_body[2]}")
     st.OnScreenLogMessage(msg, "Commands", st.Severity.Info)
@@ -327,7 +350,7 @@ while not exit_flag:
 
     # ---- planner log ----
     if USE_SPHERE and iteration % LOG_EVERY == 0:
-        msg = f"[it {iteration}] {sphere.debug_line()} | dist={dist:.0f}m"
+        msg = f"[it {iteration}] {sphere.debug_line()} lqr={lqr_profile} | dist={dist:.0f}m"
         st.OnScreenLogMessage(msg, "Planner", st.Severity.Info)
         print(msg, flush=True)
 
