@@ -72,6 +72,7 @@ from LQR import TranslationLQR
 from apf_planner import APFPlanner, APFConfig, Obstacle
 from debris_tracker import DebrisTracker, TrackerConfig
 from sphere_planner import SphereCorridorPlanner, PlannerConfig
+from score_cruise import CruiseGovernor
 ####
 
 USE_TRACKER = True      # False -> fall back to radar_to_obstacles (zero velocity)
@@ -151,6 +152,37 @@ lqr.add_profile("loose",
                 u_deadband=LOOSE_DEADBAND)
 LOOSE_AFTER_TICKS = 10      # require this many consecutive DIRECT ticks before going loose
 direct_streak = 0
+
+# ---- Score-driven burn/coast governor (ported from the teammate's AccelerationGuidance) ----
+# In DIRECT mode the governor flies the shuttle instead of the loose LQR: it burns only
+# while 2 more seconds of burn raises the predicted score, then coasts with ZERO thrust
+# (no gravity feedforward) as long as the ballistic path enters the success sphere.
+# CORRIDOR / EMERGENCY / LIFTOFF / FALLBACK still use the tight LQR, unchanged.
+USE_GOVERNOR = True         # False -> old behaviour (loose LQR in DIRECT)
+try:
+    THRUST_LIMIT = shuttle.GetParam(st.VarType.double, ["Thrusters", "MaxAccel_m_s2"])
+except Exception:
+    THRUST_LIMIT = MAX_ACCEL
+IDEAL_FUEL_PER_DV = shuttle.getMass() / (80.0 * 9.8)       # kg per m/s at Isp 80 s
+governor = CruiseGovernor(burn_accel=min(0.12, 0.5 * THRUST_LIMIT),   # teammate's measured sweet spot
+                          fuel_per_dv=1.3 * IDEAL_FUEL_PER_DV,
+                          ideal_fuel_per_dv=IDEAL_FUEL_PER_DV)
+GOV_SPEED_FLOOR = CRUISE_SPEED      # planners never get a cruise speed below this
+fuel_used = 0.0
+next_fuel_read = 0.0
+cruise = None
+
+# Gravity: point mass that falls off with distance (the old constant 0.0057 m/s^2 is the
+# surface value and overstates gravity on the way up), plus a learned residual for
+# everything else (Mars tide, rotating-frame effects). The residual is only learned
+# while coasting, so commanded thrust is never mistaken for gravity.
+try:
+    PHOBOS_MU = phobos.GetParam(st.VarType.double, ["Dynamics", "GravitationalParameter_km3_s2"]) * 1e9
+except Exception:
+    PHOBOS_MU = 7.11e5      # m^3/s^2
+external_residual = np.zeros(3)
+prev_vel = None
+prev_cmd_world = np.zeros(3)
 
 # APF: still used as the sphere planner's fallback (emergency dodge / no corridor),
 # or as the only planner when USE_SPHERE = False.
@@ -266,6 +298,23 @@ while not exit_flag:
 
     dist = np.linalg.norm(tgt_pos - pos)
 
+    # ---- gravity model + learned residual (coast-only) ----
+    r_pos = max(float(np.linalg.norm(pos)), 1.0)
+    g_central = -PHOBOS_MU * pos / r_pos**3
+    if (prev_vel is not None and iteration > 0 and 0.0 < sim_dt < 0.5
+            and np.linalg.norm(prev_cmd_world) < 1e-9):
+        residual = (vel - prev_vel) / sim_dt - g_central
+        if np.linalg.norm(residual - external_residual) < 0.04:   # reject debris impacts
+            external_residual += -np.expm1(-sim_dt / 2.0) * (residual - external_residual)
+    prev_vel = vel.copy()
+    g_total = g_central + external_residual
+
+    # ---- fuel bookkeeping for the governor (FuelUsed read once a second) ----
+    if USE_GOVERNOR and t_from_start >= next_fuel_read:
+        fuel_used = shuttle.GetParam(st.VarType.double, ["Stats", "FuelUsed"])
+        governor.learn_fuel(fuel_used)
+        next_fuel_read = t_from_start + 1.0
+
     N = 200
     debrisInfo = GetNearestDebrisLocations(N)
     w = _mark("radar", w)
@@ -302,6 +351,13 @@ while not exit_flag:
         iteration += 1
         continue
 
+    # Never let a planner ask for LESS speed than the governor already built up:
+    # dropping from 8 m/s to a 5 m/s cruise_speed in CORRIDOR would brake (fuel + time).
+    if USE_GOVERNOR:
+        speed_cap = float(np.clip(np.linalg.norm(vel), GOV_SPEED_FLOOR, 15.0))   # Phobos-frame speed
+        sphere.cfg.cruise_speed = speed_cap
+        planner.cfg.cruise_speed = planner.cfg.max_speed = speed_cap
+
     if USE_SPHERE:
         # Sphere planner picks LIFTOFF / EMERGENCY / DIRECT / CORRIDOR / FALLBACK
         # and returns an absolute reference (Phobos frame). Fallback modes call the
@@ -321,20 +377,67 @@ while not exit_flag:
         p_ref = pos
     w = _mark("planner", w)
 
-    g = -G_PHOBOS * pos / np.linalg.norm(pos)
+    g = g_total if USE_GOVERNOR else -G_PHOBOS * pos / np.linalg.norm(pos)
+
+    # Governor runs every tick (cheap) so its burn/coast hysteresis stays consistent,
+    # but it only commands thrust in DIRECT mode. Relative acceleration for the
+    # arrival prediction = ship gravity minus target acceleration (if the API gives it).
+    if USE_GOVERNOR:
+        rel_accel = g_total - (tgt_acc if tgt_acc is not None and np.all(np.isfinite(tgt_acc)) else 0.0)
+        cruise = governor.update(t_from_start, tgt_pos - pos, vel - tgt_vel, rel_accel, fuel_used)
+
+    # DIRECT only checks the straight line to the intercept point. While coasting, the
+    # shuttle follows its own velocity instead, so also check that line (within radar range)
+    # before handing control to the governor.
+    gov_active = False
+    if USE_GOVERNOR and USE_SPHERE:
+        speed_now = float(np.linalg.norm(vel))
+        closing = float((vel - tgt_vel) @ (tgt_pos - pos)) / max(dist, 1e-9)
+        coast_clear = False
+        if speed_now >= 0.5:
+            look = min(sphere.cfg.radar_range, speed_now * min(cruise.eta, 30.0))
+            coast_clear = sphere.space.segment_clear(pos, pos + vel / speed_now * look,
+                                                     t_from_start, speed_now)
+        if sphere.mode == "DIRECT":
+            # burning toward the target = DIRECT's own (already checked) line
+            gov_active = speed_now < 0.5 or cruise.mode == "BURN" or coast_clear
+        elif sphere.mode in ("CORRIDOR", "FALLBACK") and closing > 0.5 and coast_clear:
+            # The corridor exists because the straight line to the target is blocked,
+            # but our CURRENT coasting path is clear: don't chase corridor waypoints,
+            # just keep coasting. The corridor takes over again the moment this path
+            # stops being clear. (EMERGENCY and LIFTOFF never come here.)
+            gov_active = True
+            hold_accel = np.zeros(3)
+            v_dir = vel / speed_now
+            if (cruise.mode == "BURN" and v_dir @ ((tgt_pos - pos) / dist) > 0.85
+                    and sphere.space.segment_clear(pos, pos + v_dir * look, t_from_start,
+                                                   speed_now + 4.0 * governor.burn_accel)):
+                # Score still wants speed: add it ALONG the clear path (no turn, no new line)
+                hold_accel = governor.burn_accel * v_dir
+            cruise = type(cruise)("HOLD_BURN" if hold_accel.any() else "HOLD", hold_accel,
+                                  cruise.eta, cruise.advantage,
+                                  "coast path clear, corridor not needed")
 
     # Gain scheduling: loose only after a steady stretch of DIRECT (hysteresis, so a
     # DIRECT <-> CORRIDOR flicker doesn't make the gains jump back and forth).
     # Any other mode (EMERGENCY, CORRIDOR, LIFTOFF, FALLBACK) switches back to tight instantly.
     direct_streak = direct_streak + 1 if (USE_SPHERE and sphere.mode == "DIRECT") else 0
-    if direct_streak >= LOOSE_AFTER_TICKS:
+    if gov_active:
+        lqr_profile = "governor"
+    elif direct_streak >= LOOSE_AFTER_TICKS and not USE_GOVERNOR:
         lqr_profile = "loose"
         p_ref = pos                    # no cross-track pull in open space, just hold velocity
     else:
         lqr_profile = "default"
 
-    accel_world = lqr.compute(pos, vel, p_ref, v_cmd, g, dt=dt_est,
-                              profile=lqr_profile)                    # phobosFrame
+    if gov_active:
+        accel_world = np.asarray(cruise.accel, float)  # BURN / TRIM, or exactly zero on COAST
+    else:
+        accel_world = lqr.compute(pos, vel, p_ref, v_cmd, g, dt=dt_est,
+                                  profile=lqr_profile)                # phobosFrame
+    if USE_GOVERNOR:
+        governor.note_command(accel_world, dt_est)
+    prev_cmd_world = np.asarray(accel_world, float).copy()
     accel_body = st.frames.FramedVector(accel_world, phobosFrame).ExprIn(shuttleFrame)
     msg = (f"lin_accel_x: {accel_body[0]}, lin_accel_y: {accel_body[1]}, lin_accel_z: {accel_body[2]}")
     st.OnScreenLogMessage(msg, "Commands", st.Severity.Info)
@@ -350,7 +453,11 @@ while not exit_flag:
 
     # ---- planner log ----
     if USE_SPHERE and iteration % LOG_EVERY == 0:
-        msg = f"[it {iteration}] {sphere.debug_line()} lqr={lqr_profile} | dist={dist:.0f}m"
+        gov = (f" gov={cruise.mode}({cruise.reason}) eta={cruise.eta:.0f}s adv={cruise.advantage:+.2f}"
+               f" fuel={fuel_used:.1f}kg kg/mps={governor.fuel_per_dv:.2f}"
+               if USE_GOVERNOR and cruise is not None else "")
+        msg = (f"[it {iteration}] {sphere.debug_line()} lqr={lqr_profile}{gov}"
+               f" | dist={dist:.0f}m v={np.linalg.norm(vel):.1f}m/s")
         st.OnScreenLogMessage(msg, "Planner", st.Severity.Info)
         print(msg, flush=True)
 
